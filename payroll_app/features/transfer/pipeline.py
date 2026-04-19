@@ -12,6 +12,7 @@ from payroll_app.features.transfer.constants import (
     BAND_EXCLUDE,
     COLUMN_HEADER_MAP,
     EXPECTED_EXCEL_HEADERS_TEXT,
+    OPTIONAL_INTERNAL_COLUMNS,
     REQUIRED_INTERNAL_COLUMNS,
 )
 
@@ -23,6 +24,55 @@ def _trim_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+_UNNAMED_COL = re.compile(r"^Unnamed:\s*\d+$", re.I)
+
+
+def _fix_leading_unnamed_employee_id(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Excel often leaves cell **A1** blank (merged title above); pandas then names column A
+    ``Unnamed: 0``. When the next header is **Full Name**, the first column is **Employee Id**.
+    """
+    out = df.copy()
+    cols = [str(c).strip() for c in out.columns]
+    if len(cols) < 2 or not _UNNAMED_COL.match(cols[0]):
+        return out
+    second_key = cols[1].strip().lower()
+    if COLUMN_HEADER_MAP.get(second_key) == "Full Name":
+        cols[0] = "Employee Id"
+        out.columns = cols
+    return out
+
+
+def _fix_missing_company_header(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Excel often leaves the Company header blank (merged cells) so pandas uses
+    ``Unnamed: N``. When that column sits between **Grade** and **Band**, treat it as Company.
+    """
+    out = df.copy()
+    cols = [str(c).strip() for c in out.columns]
+    changed = False
+    for i in range(1, len(cols) - 1):
+        c = cols[i]
+        if not _UNNAMED_COL.match(c):
+            continue
+        if cols[i - 1].lower() == "grade" and cols[i + 1].lower() == "band":
+            cols[i] = "Company"
+            changed = True
+            break
+    if changed:
+        out.columns = cols
+    return out
+
+
+def _add_optional_internal_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Fill optional internal columns when the export omits them (e.g. Employment Status)."""
+    out = df.copy()
+    for name in OPTIONAL_INTERNAL_COLUMNS:
+        if name not in out.columns:
+            out[name] = pd.NA
+    return out
+
+
 def _map_excel_headers_to_internal(df: pd.DataFrame) -> pd.DataFrame:
     """Map workbook headers (any casing) to internal pipeline column names."""
     out = _trim_columns(df)
@@ -30,8 +80,14 @@ def _map_excel_headers_to_internal(df: pd.DataFrame) -> pd.DataFrame:
     for col in out.columns:
         key = str(col).strip().lower()
         if key not in COLUMN_HEADER_MAP:
+            hint = ""
+            if _UNNAMED_COL.match(str(col).strip()):
+                hint = (
+                    " Excel left a header cell blank. Typical fixes: type **Employee Id** in **A1** "
+                    "(first column); or type **Company** between **Grade** and **Band** if that header is missing."
+                )
             raise ValueError(
-                f'Unexpected column "{col}". Expected headers: {EXPECTED_EXCEL_HEADERS_TEXT}'
+                f'Unexpected column "{col}".{hint} Expected: {EXPECTED_EXCEL_HEADERS_TEXT}'
             )
         new_cols.append(COLUMN_HEADER_MAP[key])
     out.columns = new_cols
@@ -63,7 +119,11 @@ def read_uploaded_excel(uploaded_file: Any, entity_label: str) -> pd.DataFrame:
         raw = pd.read_excel(uploaded_file, engine="openpyxl")
     except Exception as e:
         raise ValueError(f"Could not read Excel file '{entity_label}': {e}") from e
-    df = _map_excel_headers_to_internal(raw)
+    df = _trim_columns(raw)
+    df = _fix_leading_unnamed_employee_id(df)
+    df = _fix_missing_company_header(df)
+    df = _map_excel_headers_to_internal(df)
+    df = _add_optional_internal_columns(df)
     _validate_required_columns(df)
     return df
 
@@ -78,6 +138,26 @@ def _strip_if_str(val: Any) -> Any:
     return val.strip() if isinstance(val, str) else val
 
 
+def _coerce_id_scalar(val: Any) -> Any:
+    """Normalize Excel numeric/string IDs (Employee Id, Aadhaar) to trimmed strings."""
+    if pd.isna(val):
+        return val
+    if isinstance(val, str):
+        return val.strip()
+    if isinstance(val, bool):
+        return str(val)
+    if isinstance(val, (int, np.integer)):
+        return str(int(val))
+    if isinstance(val, float):
+        if np.isnan(val):
+            return val
+        rounded = round(val)
+        if abs(val - rounded) < 1e-9:
+            return str(int(rounded))
+        return str(val)
+    return str(val).strip()
+
+
 def clean_data(df: pd.DataFrame) -> pd.DataFrame:
     """
     Step 2: Data cleaning — datetime DOJ/DOL, normalize to calendar dates,
@@ -89,11 +169,14 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
         out[col] = pd.to_datetime(out[col], errors="coerce")
         out[col] = out[col].dt.normalize()
 
+    if "Employee Code" in out.columns:
+        out["Employee Code"] = out["Employee Code"].map(_coerce_id_scalar)
+    if "Aadhaar Number" in out.columns:
+        out["Aadhaar Number"] = out["Aadhaar Number"].map(_coerce_id_scalar)
+
     str_cols = [
-        "Employee Code",
         "Full Name",
         "PAN Number",
-        "Aadhaar Number",
         "Personal Email ID",
         "Band",
         "Grade",
@@ -215,6 +298,47 @@ def assign_unique_id(
         ),
     )
     out["Unique_ID"] = uid
+    return out
+
+
+def reconcile_unique_identity(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge split ``Unique_ID`` values that refer to the same person.
+
+    Initial assignment can emit different IDs for the same employee when, for
+    example, PAN is duplicated across codes (fallback to different Aadhaars), or
+    one row carries a typo PAN while **Personal Email** matches.
+
+    Rule: rows sharing the same **Personal Email ID** use one canonical ID —
+    the **most frequent non-null PAN** in that email group (fixes typos where
+    one row has a wrong PAN); if no PAN in the group, the normalized email string.
+
+    We **do not** merge only by PAN: the same PAN can incorrectly appear on two
+    different people (duplicate data entry); email keeps them apart.
+    """
+    out = df.copy()
+    if out.empty:
+        return out
+
+    def _canon_from_email_group(grp: pd.DataFrame) -> str:
+        pans = grp["PAN Number"].dropna()
+        pans = pans[pans.astype(str).str.strip() != ""]
+        if not pans.empty:
+            # Prefer idxmax frequency — multiple modes can occur with `.mode().iloc[0]` picking wrongly.
+            vc = pans.astype(str).str.upper().str.strip().value_counts()
+            if not vc.empty:
+                return str(vc.index[0])
+        e = grp["Personal Email ID"].dropna()
+        if not e.empty:
+            return str(e.iloc[0]).strip().lower()
+        return str(grp["Unique_ID"].iloc[0])
+
+    if "Personal Email ID" in out.columns:
+        for _email, grp in out.groupby("Personal Email ID", sort=False, dropna=True):
+            if grp["Unique_ID"].nunique() <= 1:
+                continue
+            out.loc[grp.index, "Unique_ID"] = _canon_from_email_group(grp)
+
     return out
 
 
@@ -410,6 +534,7 @@ def process_files(df_a: pd.DataFrame, df_b: pd.DataFrame) -> tuple[pd.DataFrame,
     dup_pan, dup_aadhaar = duplicate_identifier_sets(filtered)
     with_disc = assign_discrepancies(filtered, dup_pan, dup_aadhaar)
     with_uid = assign_unique_id(with_disc, dup_pan, dup_aadhaar)
+    with_uid = reconcile_unique_identity(with_uid)
     with_xfer = add_transfer_flags(with_uid)
 
     detailed, flat_df = enrich_gaps_and_flatten(with_xfer)

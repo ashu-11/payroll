@@ -10,7 +10,8 @@ from __future__ import annotations
 #   Date Of Exit → Date of Leaving (DOL)
 #   Personal Email Id → Personal Email ID
 #   Pan Number → PAN Number
-#   Company → Entity (legal entity per row — not derived from filename)
+#   company / Company → Entity
+# Employment Status is optional (many exports omit it).
 COLUMN_HEADER_MAP: dict[str, str] = {
     "employee id": "Employee Code",
     "full name": "Full Name",
@@ -25,13 +26,34 @@ COLUMN_HEADER_MAP: dict[str, str] = {
     "company": "Entity",
 }
 
-# All columns above must appear after mapping (exactly once each).
-REQUIRED_INTERNAL_COLUMNS = list(dict.fromkeys(COLUMN_HEADER_MAP.values()))
+# Present in COLUMN_HEADER_MAP but not required on the sheet (added as empty if missing).
+OPTIONAL_INTERNAL_COLUMNS = frozenset({"Employment Status"})
+
+REQUIRED_INTERNAL_COLUMNS = [
+    v for v in dict.fromkeys(COLUMN_HEADER_MAP.values()) if v not in OPTIONAL_INTERNAL_COLUMNS
+]
 
 BAND_EXCLUDE = {"B0", "Third Party"}
 
-# Copy for errors / UI (human-readable original header names).
+# Shown in validation errors (single line).
 EXPECTED_EXCEL_HEADERS_TEXT = (
-    "Employee Id, Full Name, Date Of Joining, Grade, Band, Personal Email Id, "
-    "Pan Number, Aadhaar Number, Employment Status, Date Of Exit, Company"
+    "Employee Id; Full Name; Date Of Joining; Grade; Company; Band; "
+    "Personal Email Id; Pan Number; Aadhaar Number; Date Of Exit "
+    "(optional: Employment Status). "
+    "Blank Company header between Grade and Band is supported."
 )
+
+# Dashboard copy — order matches typical HR extracts (see sample `extracted1.xlsx` / `extracted2.xlsx`).
+CANONICAL_EXCEL_HEADERS_DISPLAY: tuple[str, ...] = (
+    "Employee Id",
+    "Full Name",
+    "Date Of Joining",
+    "Grade",
+    "Company",
+    "Band",
+    "Personal Email Id",
+    "Pan Number",
+    "Aadhaar Number",
+    "Date Of Exit",
+)
+OPTIONAL_EXCEL_HEADERS_DISPLAY: tuple[str, ...] = ("Employment Status",)

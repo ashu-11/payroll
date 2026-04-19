@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import streamlit as st
 
-from payroll_app.features.transfer.constants import EXPECTED_EXCEL_HEADERS_TEXT
-from payroll_app.features.transfer.export import dataframe_to_excel_bytes
+from payroll_app.features.transfer.constants import (
+    CANONICAL_EXCEL_HEADERS_DISPLAY,
+    OPTIONAL_EXCEL_HEADERS_DISPLAY,
+)
+from payroll_app.features.transfer.report_output import build_transfer_report, report_to_excel_bytes
 from payroll_app.features.transfer.pipeline import process_files, read_uploaded_excel
 
 
@@ -18,12 +21,16 @@ def render_transfer_analyzer() -> None:
             "headers (first row); header text is matched case-insensitively."
         )
         with st.expander("Required Excel columns"):
-            st.markdown(
-                "Each workbook must contain these columns:\n\n"
-                + "\n".join(f"- `{h.strip()}`" for h in EXPECTED_EXCEL_HEADERS_TEXT.split(", "))
-            )
+            st.markdown("**Required** (header row, case-insensitive):")
+            for h in CANONICAL_EXCEL_HEADERS_DISPLAY:
+                st.markdown(f"- `{h}`")
+            st.markdown("**Optional:**")
+            for h in OPTIONAL_EXCEL_HEADERS_DISPLAY:
+                st.markdown(f"- `{h}`")
             st.caption(
-                "**Entity** for matching is taken from the **Company** column (not the file name)."
+                "Legal entity for transfer matching comes from **Company**. "
+                "If **A1** (Employee Id) or the Company header cell is empty, either type the header "
+                "or keep the same column order as your HR extract — missing titles are detected when possible."
             )
     with top_r:
         st.markdown("")
@@ -62,22 +69,27 @@ def render_transfer_analyzer() -> None:
                 )
                 return
 
+            report_df = build_transfer_report(detail_df, flat_df)
+
             st.success(
-                f"Processing complete. **{len(flat_df)}** employee row(s) in flattened output."
+                f"Processing complete. **{len(report_df)}** employee row(s) in transfer report."
             )
 
-            st.subheader("Preview (first 20 rows)")
-            st.dataframe(flat_df.head(20), use_container_width=True)
+            st.subheader("Preview (transfer report)")
+            st.dataframe(report_df.head(20), use_container_width=True)
 
-            excel_buf = dataframe_to_excel_bytes(flat_df)
+            excel_buf = report_to_excel_bytes(report_df)
             st.download_button(
-                label="Download Excel output",
+                label="Download Excel report",
                 data=excel_buf,
-                file_name="employee_transfer_flattened.xlsx",
+                file_name="employee_transfer_report.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
-            with st.expander("Row-level detail preview (optional)"):
+            with st.expander("Technical detail (pipeline flat row, optional)"):
+                st.dataframe(flat_df.head(20), use_container_width=True)
+
+            with st.expander("Row-level employment history (optional)"):
                 st.dataframe(detail_df.head(50), use_container_width=True)
 
         except ValueError as ve:
