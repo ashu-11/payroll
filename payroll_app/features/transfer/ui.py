@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import streamlit as st
 
+from payroll_app.features.transfer.constants import EXPECTED_EXCEL_HEADERS_TEXT
 from payroll_app.features.transfer.export import dataframe_to_excel_bytes
 from payroll_app.features.transfer.pipeline import process_files, read_uploaded_excel
 
@@ -13,8 +14,17 @@ def render_transfer_analyzer() -> None:
     with top_l:
         st.title("Employee Transfer Analyzer")
         st.markdown(
-            "Upload two employee master Excel files. Each must include the required columns."
+            "Upload two `.xlsx` employee master exports. Each file must use the standard "
+            "headers (first row); header text is matched case-insensitively."
         )
+        with st.expander("Required Excel columns"):
+            st.markdown(
+                "Each workbook must contain these columns:\n\n"
+                + "\n".join(f"- `{h.strip()}`" for h in EXPECTED_EXCEL_HEADERS_TEXT.split(", "))
+            )
+            st.caption(
+                "**Entity** for matching is taken from the **Company** column (not the file name)."
+            )
     with top_r:
         st.markdown("")
         if st.button("← Back to dashboard", use_container_width=True):

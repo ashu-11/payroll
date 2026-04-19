@@ -8,7 +8,12 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from payroll_app.features.transfer.constants import BAND_EXCLUDE, REQUIRED_COLUMNS
+from payroll_app.features.transfer.constants import (
+    BAND_EXCLUDE,
+    COLUMN_HEADER_MAP,
+    EXPECTED_EXCEL_HEADERS_TEXT,
+    REQUIRED_INTERNAL_COLUMNS,
+)
 
 
 def _trim_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -18,28 +23,48 @@ def _trim_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _map_excel_headers_to_internal(df: pd.DataFrame) -> pd.DataFrame:
+    """Map workbook headers (any casing) to internal pipeline column names."""
+    out = _trim_columns(df)
+    new_cols: list[str] = []
+    for col in out.columns:
+        key = str(col).strip().lower()
+        if key not in COLUMN_HEADER_MAP:
+            raise ValueError(
+                f'Unexpected column "{col}". Expected headers: {EXPECTED_EXCEL_HEADERS_TEXT}'
+            )
+        new_cols.append(COLUMN_HEADER_MAP[key])
+    out.columns = new_cols
+    dup_mask = out.columns.duplicated()
+    if dup_mask.any():
+        dupes = out.columns[dup_mask].unique().tolist()
+        raise ValueError(
+            "Duplicate columns after mapping (each logical column must appear once): "
+            + ", ".join(str(x) for x in dupes)
+        )
+    return out
+
+
 def _validate_required_columns(df: pd.DataFrame) -> None:
-    """Raise ValueError with a clear message if required columns are missing."""
-    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    """Raise ValueError if any required internal column is missing."""
+    missing = [c for c in REQUIRED_INTERNAL_COLUMNS if c not in df.columns]
     if missing:
         raise ValueError(
-            "Missing required column(s): "
+            "Missing column(s) after mapping: "
             + ", ".join(missing)
-            + ". Ensure both files include all required columns (names are trimmed)."
+            + ". Ensure the sheet includes all expected headers (see below).\n"
+            + EXPECTED_EXCEL_HEADERS_TEXT
         )
 
 
 def read_uploaded_excel(uploaded_file: Any, entity_label: str) -> pd.DataFrame:
-    """Read one Excel file from Streamlit upload and attach Entity from file name."""
+    """Read one Excel file from Streamlit upload; map headers; Entity comes from Company."""
     try:
         raw = pd.read_excel(uploaded_file, engine="openpyxl")
     except Exception as e:
         raise ValueError(f"Could not read Excel file '{entity_label}': {e}") from e
-    df = _trim_columns(raw)
+    df = _map_excel_headers_to_internal(raw)
     _validate_required_columns(df)
-    base = getattr(uploaded_file, "name", entity_label) or entity_label
-    entity = re.sub(r"\.[^.]+$", "", str(base)).strip() or entity_label
-    df["Entity"] = entity
     return df
 
 
@@ -66,11 +91,13 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
 
     str_cols = [
         "Employee Code",
+        "Full Name",
         "PAN Number",
         "Aadhaar Number",
         "Personal Email ID",
         "Band",
         "Grade",
+        "Employment Status",
         "Entity",
     ]
     for c in str_cols:
